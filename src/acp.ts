@@ -1,18 +1,47 @@
 import { spawn } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
+import { terminateProcessTree } from "./process.js";
 
 const maxOutputLength = 100_000;
 
-type PermissionHandler = (
-  request: acp.RequestPermissionRequest,
+export const defaultTimeoutMs = 10 * 60 * 1000;
+
+/** Identifiable timeout: `code` is stable for programmatic handling. */
+export class McodeTimeoutError extends Error {
+  readonly code = "MCODE_TIMEOUT" as const;
+  constructor(
+    readonly phase: "queued" | "running",
+    readonly elapsedMs: number,
+    timeoutMs: number,
+  ) {
+    super(
+      `MCODE_TIMEOUT [phase=${phase}] MCode ACP timed out after ${timeoutMs}ms.`,
+    );
+  }
+}
+
+export type PermissionHandler = (
+  context: acp.ClientRequestContext<acp.RequestPermissionRequest>,
 ) => Promise<acp.RequestPermissionResponse>;
+
+/** Resolves when the signal aborts (already-aborted signals resolve now). */
+export function whenAborted(signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    signal.addEventListener("abort", () => resolve(), { once: true });
+  });
+}
 
 export type McodePrompt = {
   sessionID: string;
   cwd: string;
   prompt: string;
   signal: AbortSignal;
+  /**
+   * Total budget in milliseconds from when the tool is invoked, including
+   * time spent waiting for the session turn. Defaults to 10 minutes.
+   */
   timeoutMs?: number;
   requestPermission?: PermissionHandler;
 };
@@ -26,7 +55,7 @@ export type McodeResult = {
 
 export class McodeAcpBridge {
   private readonly sessions = new Map<string, string>();
-  private readonly queues = new Map<string, Promise<McodeResult>>();
+  private readonly tails = new Map<string, Promise<void>>();
   private readonly command: string;
   private readonly args: string[];
 
@@ -36,24 +65,102 @@ export class McodeAcpBridge {
   }
 
   async prompt(input: McodePrompt): Promise<McodeResult> {
-    const previous = this.queues.get(input.sessionID) ?? Promise.resolve(undefined);
-    const current = previous.catch(() => undefined).then(() => this.run(input));
-    this.queues.set(input.sessionID, current);
+    const timeoutMs = input.timeoutMs ?? defaultTimeoutMs;
+    const start = Date.now();
+    const deadline = start + timeoutMs;
+    const previous = this.tails.get(input.sessionID) ?? Promise.resolve();
+    let releaseTurn!: () => void;
+    const turn = new Promise<void>((resolve) => {
+      releaseTurn = resolve;
+    });
+    const chained = previous.then(
+      () => turn,
+      () => turn,
+    );
+    this.tails.set(input.sessionID, chained);
     try {
-      return await current;
+      await this.waitForTurn(previous, input.signal, start, deadline, timeoutMs);
+      return await this.run(input, start, deadline, timeoutMs);
     } finally {
-      if (this.queues.get(input.sessionID) === current) {
-        this.queues.delete(input.sessionID);
+      releaseTurn();
+      if (this.tails.get(input.sessionID) === chained) {
+        this.tails.delete(input.sessionID);
       }
     }
   }
 
-  private async run(input: McodePrompt): Promise<McodeResult> {
+  /**
+   * Waits for the previous turn without spawning anything. An abort or the
+   * total timeout rejects here, so a cancelled queued call never starts a
+   * session, never sends its prompt, and never blocks or disturbs the
+   * active turn. A previous turn's failure never blocks the queue either.
+   */
+  private waitForTurn(
+    previous: Promise<unknown>,
+    signal: AbortSignal,
+    start: number,
+    deadline: number,
+    timeoutMs: number,
+  ): Promise<void> {
+    signal.throwIfAborted();
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        reject(new McodeTimeoutError("queued", Date.now() - start, timeoutMs));
+        return;
+      }
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        reject(new McodeTimeoutError("queued", Date.now() - start, timeoutMs));
+      }, remaining);
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(signal.reason);
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      previous.then(
+        () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          signal.removeEventListener("abort", onAbort);
+          resolve();
+        },
+        () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          signal.removeEventListener("abort", onAbort);
+          resolve();
+        },
+      );
+    });
+  }
+
+  private async run(
+    input: McodePrompt,
+    start: number,
+    deadline: number,
+    timeoutMs: number,
+  ): Promise<McodeResult> {
+    // Re-check: the turn may have been granted after an abort raced it.
     input.signal.throwIfAborted();
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      throw new McodeTimeoutError("running", Date.now() - start, timeoutMs);
+    }
     const child = spawn(this.command, this.args, {
       cwd: input.cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: process.env,
+      // Group leader on POSIX so termination signals reach only the tree
+      // this plugin started (see terminateProcessTree).
+      detached: process.platform !== "win32",
     });
     child.stderr?.resume();
     const stream = acp.ndJsonStream(
@@ -70,22 +177,34 @@ export class McodeAcpBridge {
           params.update.content.type === "text"
         ) {
           const chunk = params.update.content.text;
-          const remaining = maxOutputLength - output.length;
-          output += chunk.slice(0, remaining);
-          outputTruncated ||= chunk.length > remaining;
+          const spare = maxOutputLength - output.length;
+          output += chunk.slice(0, spare);
+          outputTruncated ||= chunk.length > spare;
         }
       });
     if (input.requestPermission) {
-      app.onRequest(
-        acp.methods.client.session.requestPermission,
-        ({ params }) => input.requestPermission!(params),
+      const handle = input.requestPermission;
+      const cancelled: acp.RequestPermissionResponse = {
+        outcome: { outcome: "cancelled" },
+      };
+      app.onRequest(acp.methods.client.session.requestPermission, (context) =>
+        // Never let a permission decision outlive its call: whichever
+        // settles first wins, and a late handler response after an abort
+        // has no effect on the already-cancelled turn.
+        Promise.race([
+          handle(context),
+          whenAborted(context.signal).then(() => cancelled),
+          whenAborted(input.signal).then(() => cancelled),
+        ]),
       );
     }
 
     const connection = app.connect(stream);
     let sessionId: string | undefined;
-    const timeout = AbortSignal.timeout(input.timeoutMs ?? 10 * 60 * 1000);
-    const signal = AbortSignal.any([input.signal, timeout]);
+    const executionTimeout = AbortSignal.timeout(remaining);
+    const signal = AbortSignal.any([input.signal, executionTimeout]);
+    let result: McodeResult | undefined;
+    let failure: unknown;
     try {
       await connection.agent.request(
         acp.methods.agent.initialize,
@@ -119,6 +238,8 @@ export class McodeAcpBridge {
       }
 
       signal.throwIfAborted();
+      // Cooperative prompt cancellation: asks the agent to stop the turn.
+      // Executor shutdown happens separately below in all cases.
       const cancel = () => {
         if (sessionId) {
           void connection.agent.notify(acp.methods.agent.session.cancel, {
@@ -130,7 +251,7 @@ export class McodeAcpBridge {
       output = "";
       outputTruncated = false;
       try {
-        const result = await connection.agent.request(
+        const response = await connection.agent.request(
           acp.methods.agent.session.prompt,
           {
             sessionId,
@@ -139,34 +260,50 @@ export class McodeAcpBridge {
           { cancellationSignal: signal },
         );
         signal.throwIfAborted();
-        return { sessionId, output, outputTruncated, stopReason: result.stopReason };
+        result = {
+          sessionId,
+          output,
+          outputTruncated,
+          stopReason: response.stopReason,
+        };
       } finally {
         signal.removeEventListener("abort", cancel);
       }
     } catch (error) {
-      if (input.signal.aborted) throw input.signal.reason;
-      if (!child.pid) {
-        throw new Error(`Could not start MCode ACP process "${this.command}".`);
+      if (input.signal.aborted) {
+        failure = input.signal.reason;
+      } else if (!child.pid) {
+        failure = new Error(
+          `Could not start MCode ACP process "${this.command}".`,
+        );
+      } else if (executionTimeout.aborted) {
+        failure = new McodeTimeoutError(
+          "running",
+          Date.now() - start,
+          timeoutMs,
+        );
+      } else {
+        failure = new Error(`MCode ACP failed: ${errorMessage(error)}`);
       }
-      if (timeout.aborted && !input.signal.aborted) {
-        throw new Error(`MCode ACP timed out after ${input.timeoutMs ?? 600_000}ms.`);
-      }
-      throw new Error(`MCode ACP failed: ${errorMessage(error)}`);
     } finally {
       connection.close();
-      child.kill();
-      await new Promise<void>((resolve) => {
-        if (child.exitCode !== null || child.signalCode !== null) return resolve();
-        const timer = setTimeout(() => {
-          child.kill("SIGKILL");
-          resolve();
-        }, 1000);
-        child.once("exit", () => {
-          clearTimeout(timer);
-          resolve();
-        });
-      });
     }
+
+    // Executor shutdown is distinct from prompt cancellation: the process
+    // (and only its own tree) is always reaped, and only an observed exit
+    // counts. A forced close invalidates the cached session so the next
+    // call starts fresh on a new process.
+    const termination = await terminateProcessTree(child, { graceMs: 2000 });
+    if (termination.forced || !termination.exited) {
+      this.sessions.delete(input.sessionID);
+    }
+    if (!termination.exited) {
+      throw new Error(
+        `MCode ACP executor (pid ${child.pid ?? "unknown"}) did not exit after SIGKILL; its session mapping was discarded.`,
+      );
+    }
+    if (failure !== undefined) throw failure;
+    return result!;
   }
 }
 

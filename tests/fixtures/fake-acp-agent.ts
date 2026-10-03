@@ -30,11 +30,40 @@ const app = acp
       .filter((block) => block.type === "text")
       .map((block) => block.text)
       .join("");
+    if (process.env.FAKE_AGENT_LOG) {
+      await import("node:fs/promises").then((fs) =>
+        fs.appendFile(process.env.FAKE_AGENT_LOG!, prompt + "\n"),
+      );
+    }
     if (prompt === "wait") {
       await new Promise<void>((resolve) => {
         cancelPrompt = resolve;
       });
       return { stopReason: "cancelled" };
+    }
+    if (prompt === "need-permission") {
+      const decision = await client.request(
+        acp.methods.client.session.requestPermission,
+        {
+          sessionId: params.sessionId,
+          toolCall: { toolCallId: "call_1", title: "write file" },
+          options: [
+            { optionId: "allow", name: "Allow once", kind: "allow_once" },
+            { optionId: "deny", name: "Reject", kind: "reject_once" },
+          ],
+        },
+      );
+      const granted =
+        decision.outcome.outcome === "selected" &&
+        decision.outcome.optionId === "allow";
+      await client.notify(acp.methods.client.session.update, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: granted ? "granted" : "denied" },
+        },
+      });
+      return { stopReason: "end_turn" };
     }
     const prefix = loaded.has(params.sessionId) ? "loaded" : "new";
     await client.notify(acp.methods.client.session.update, {
